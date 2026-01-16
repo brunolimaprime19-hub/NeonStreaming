@@ -322,9 +322,9 @@ function setupDataChannel(channel) {
     channel.onclose = () => console.log('Data Channel Fechado');
 }
 
-function sendInput(type, code, value) {
+function sendInput(type, code, value, gamepadIndex = 0) {
     if (dc && dc.readyState === 'open') {
-        dc.send(JSON.stringify({ type, code, value }));
+        dc.send(JSON.stringify({ type, code, value, gamepadIndex }));
     }
 }
 
@@ -1740,9 +1740,7 @@ if (qualityBtn) {
 class GamepadManager {
     constructor() {
         this.gamepads = {};
-        this.activeGamepadIndex = null;
-        this.prevButtons = [];
-        this.prevAxes = [];
+        this.activeGamepads = {}; // Map: index -> { prevButtons: [], prevAxes: [] }
         this.pollingInterval = null;
         this.discoveryInterval = null;
 
@@ -1777,7 +1775,7 @@ class GamepadManager {
         this.discoveryInterval = setInterval(() => {
             const gps = navigator.getGamepads ? navigator.getGamepads() : [];
             for (let i = 0; i < gps.length; i++) {
-                if (gps[i] && this.activeGamepadIndex === null) {
+                if (gps[i] && !this.activeGamepads[gps[i].index]) {
                     this.onConnect(gps[i]);
                 }
             }
@@ -1786,29 +1784,38 @@ class GamepadManager {
 
     onConnect(gp) {
         if (!gp) return;
-        console.log("🎮 Gamepad DETECTED:", gp.id);
+        if (Object.keys(this.activeGamepads).length >= 4) return; // Limit to 4 for stability
 
-        if (this.activeGamepadIndex !== null) return; // Already have one
+        console.log(`🎮 Gamepad DETECTED: [${gp.index}] ${gp.id}`);
 
-        this.activeGamepadIndex = gp.index;
+        this.activeGamepads[gp.index] = {
+            prevButtons: new Array(gp.buttons.length).fill(0),
+            prevAxes: new Array(gp.axes.length).fill(0)
+        };
+
         this.startPolling();
 
         // Visual Feedback to User (Toast)
         const toast = document.createElement('div');
         toast.style.cssText = "position:fixed; top:20px; left:50%; transform:translateX(-50%); background:#22c55e; color:white; padding:15px; border-radius:10px; z-index:10000; font-weight:bold; box-shadow:0 5px 15px rgba(0,0,0,0.5); text-align:center; font-size:16px;";
-        toast.innerText = `🎮 Controle Conectado!\n${gp.id.substring(0, 20)}...`;
+        toast.innerText = `🎮 Controle ${Object.keys(this.activeGamepads).length} Conectado!\n${gp.id.substring(0, 20)}...`;
         document.body.appendChild(toast);
-        setTimeout(() => toast.remove(), 4000); // Remove after 4s
+        setTimeout(() => toast.remove(), 4000);
 
         const statusMsg = document.getElementById('status-msg');
-        if (statusMsg) statusMsg.innerText = `Controle: ${gp.id.substring(0, 15)}`;
+        if (statusMsg) statusMsg.innerText = `Controles: ${Object.keys(this.activeGamepads).length} ativos`;
     }
 
     onDisconnect(gp) {
-        if (this.activeGamepadIndex === gp.index) {
-            console.log("⚠️ Gamepad Lost");
-            this.activeGamepadIndex = null;
-            this.stopPolling();
+        if (this.activeGamepads[gp.index]) {
+            console.log(`⚠️ Gamepad Lost: [${gp.index}]`);
+            delete this.activeGamepads[gp.index];
+
+            if (Object.keys(this.activeGamepads).length === 0) {
+                this.stopPolling();
+                const statusMsg = document.getElementById('status-msg');
+                if (statusMsg) statusMsg.innerText = "Controle: Nenhum";
+            }
 
             // Notify user
             const toast = document.createElement('div');
@@ -1832,48 +1839,58 @@ class GamepadManager {
     }
 
     pollStatus() {
-        if (this.activeGamepadIndex === null) return;
+        if (Object.keys(this.activeGamepads).length === 0) return;
 
         const navigatorGamepads = navigator.getGamepads ? navigator.getGamepads() : [];
-        const gp = navigatorGamepads[this.activeGamepadIndex];
 
-        if (!gp || !gp.connected) {
-            this.onDisconnect({ index: this.activeGamepadIndex });
-            return;
-        }
+        // Treat each connected gamepad as a player
+        let playerIndex = 0;
+        for (const gpIndex in this.activeGamepads) {
+            const gp = navigatorGamepads[gpIndex];
+            const state = this.activeGamepads[gpIndex];
 
-        // --- BUTTONS ---
-        gp.buttons.forEach((btn, index) => {
-            const val = btn.pressed ? 1 : 0;
-            if (this.prevButtons[index] !== val) {
-                this.prevButtons[index] = val;
+            if (!gp || !gp.connected) {
+                this.onDisconnect({ index: gpIndex });
+                continue;
+            }
 
-                const code = this.btnMap[index];
-                if (code) {
-                    sendInput('BUTTON', code, val);
+            // --- BUTTONS ---
+            gp.buttons.forEach((btn, bIdx) => {
+                const val = btn.pressed ? 1 : 0;
+                if (state.prevButtons[bIdx] !== val) {
+                    state.prevButtons[bIdx] = val;
 
-                    // Visual Feedback
-                    const virtualBtn = document.querySelector(`button[data-key="${code}"]`) ||
-                        document.querySelector(`.control-btn[data-key="${code}"]`);
-                    if (virtualBtn) {
-                        if (val) virtualBtn.classList.add('active');
-                        else virtualBtn.classList.remove('active');
+                    const code = this.btnMap[bIdx];
+                    if (code) {
+                        sendInput('BUTTON', code, val, playerIndex);
+
+                        // Visual Feedback (Only for Player 1 to avoid UI mess)
+                        if (playerIndex === 0) {
+                            const virtualBtn = document.querySelector(`button[data-key="${code}"]`) ||
+                                document.querySelector(`.control-btn[data-key="${code}"]`);
+                            if (virtualBtn) {
+                                if (val) virtualBtn.classList.add('active');
+                                else virtualBtn.classList.remove('active');
+                            }
+                        }
                     }
                 }
-            }
-        });
+            });
 
-        // --- AXES ---
-        gp.axes.forEach((val, index) => {
-            if (Math.abs(val) < 0.15) val = 0;
-            const intVal = Math.round(val * 32767);
+            // --- AXES ---
+            gp.axes.forEach((val, aIdx) => {
+                if (Math.abs(val) < 0.15) val = 0;
+                const intVal = Math.round(val * 32767);
 
-            if (Math.abs((this.prevAxes[index] || 0) - intVal) > 500) {
-                this.prevAxes[index] = intVal;
-                const code = this.axisMap[index];
-                if (code) sendInput('AXIS', code, intVal);
-            }
-        });
+                if (Math.abs((state.prevAxes[aIdx] || 0) - intVal) > 500) {
+                    state.prevAxes[aIdx] = intVal;
+                    const code = this.axisMap[aIdx];
+                    if (code) sendInput('AXIS', code, intVal, playerIndex);
+                }
+            });
+
+            playerIndex++;
+        }
     }
 }
 

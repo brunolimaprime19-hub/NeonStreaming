@@ -15,8 +15,10 @@ logger = logging.getLogger("InputManager")
 
 class InputManager:
     def __init__(self):
-        # --- GAMEPAD (Xbox Style) ---
-        cap_gamepad = {
+        self.gamepads = {} # Map: index -> virtual_device
+        
+        # Capabilities template (Xbox Style)
+        self.cap_gamepad = {
             ecodes.EV_KEY: [
                 ecodes.BTN_A, ecodes.BTN_B, ecodes.BTN_X, ecodes.BTN_Y,
                 ecodes.BTN_TL, ecodes.BTN_TR, ecodes.BTN_SELECT, ecodes.BTN_START,
@@ -33,29 +35,37 @@ class InputManager:
                 (ecodes.ABS_HAT0Y, AbsInfo(value=0, min=-1, max=1, fuzz=0, flat=0, resolution=0)),
             ]
         }
+    def _get_gamepad(self, index):
+        """Returns or creates a virtual gamepad for the given index."""
+        if index in self.gamepads:
+            return self.gamepads[index]
         
         try:
+            device = None
             if not IS_WINDOWS:
-                self.ui_gamepad = UInput(cap_gamepad, name="NeonGamepad", version=0x1)
-                logger.info("Virtual Device Created: Gamepad (evdev)")
+                device = UInput(self.cap_gamepad, name=f"NeonGamepad P{index+1}", version=0x1)
+                logger.info(f"Virtual Device Created: Gamepad P{index+1} (evdev)")
             else:
                 if vg:
-                    self.ui_gamepad = vg.VX360Gamepad()
-                    logger.info("Virtual Device Created: Gamepad (vgamepad)")
+                    device = vg.VX360Gamepad()
+                    logger.info(f"Virtual Device Created: Gamepad P{index+1} (vgamepad)")
                 else:
-                    self.ui_gamepad = None
-                    logger.error("vgamepad not installed. Run 'pip install vgamepad'")
+                    logger.error("vgamepad not installed.")
+            
+            self.gamepads[index] = device
+            return device
         except Exception as e:
-            self.ui_gamepad = None
-            logger.error(f"Failed to create Virtual Gamepad: {e}")
+            logger.error(f"Failed to create Virtual Gamepad P{index+1}: {e}")
+            return None
 
     def handle_input(self, data):
         type_ = data.get('type')
         code = data.get('code')
         value = data.get('value')
+        gp_index = data.get('gamepadIndex', 0)
 
-        if not self.ui_gamepad:
-            logger.error("CRITICAL: Virtual Gamepad not initialized (Check /dev/uinput permissions)")
+        device = self._get_gamepad(gp_index)
+        if not device:
             return
 
         if type_ == 'BUTTON':
@@ -77,10 +87,10 @@ class InputManager:
                     if not IS_WINDOWS:
                         if isinstance(mapped, tuple):
                             val = mapped[2] if value else 0
-                            self.ui_gamepad.write(mapped[0], mapped[1], val)
+                            device.write(mapped[0], mapped[1], val)
                         else:
-                            self.ui_gamepad.write(ecodes.EV_KEY, mapped, 1 if value else 0)
-                        self.ui_gamepad.syn()
+                            device.write(ecodes.EV_KEY, mapped, 1 if value else 0)
+                        device.syn()
                     else:
                         # vgamepad logic
                         vg_map = {
@@ -101,13 +111,13 @@ class InputManager:
                             'DPAD_RIGHT': vg.XUSB_BUTTON.XUSB_GAMEPAD_DPAD_RIGHT,
                         }
                         if code in vg_map:
-                            if value: self.ui_gamepad.press_button(button=vg_map[code])
-                            else: self.ui_gamepad.release_button(button=vg_map[code])
+                            if value: device.press_button(button=vg_map[code])
+                            else: device.release_button(button=vg_map[code])
                         elif code == 'LT':
-                            self.ui_gamepad.left_trigger(value=int(value))
+                            device.left_trigger(value=int(value))
                         elif code == 'RT':
-                            self.ui_gamepad.right_trigger(value=int(value))
-                        self.ui_gamepad.update()
+                            device.right_trigger(value=int(value))
+                        device.update()
                 except Exception as e:
                     logger.debug(f"Input handling error: {e}")
 
@@ -119,14 +129,14 @@ class InputManager:
             if code in axis_map:
                 try:
                     if not IS_WINDOWS:
-                        self.ui_gamepad.write(ecodes.EV_ABS, axis_map[code], value)
-                        self.ui_gamepad.syn()
+                        device.write(ecodes.EV_ABS, axis_map[code], value)
+                        device.syn()
                     else:
                         # vgamepad uses -32768 to 32767 for axes, same as we receive
-                        if code == 'LEFT_X': self.ui_gamepad.left_joystick(x_value=int(value), y_value=None)
-                        elif code == 'LEFT_Y': self.ui_gamepad.left_joystick(x_value=None, y_value=int(value))
-                        elif code == 'RIGHT_X': self.ui_gamepad.right_joystick(x_value=int(value), y_value=None)
-                        elif code == 'RIGHT_Y': self.ui_gamepad.right_joystick(x_value=None, y_value=int(value))
-                        self.ui_gamepad.update()
+                        if code == 'LEFT_X': device.left_joystick(x_value=int(value), y_value=None)
+                        elif code == 'LEFT_Y': device.left_joystick(x_value=None, y_value=int(value))
+                        elif code == 'RIGHT_X': device.right_joystick(x_value=int(value), y_value=None)
+                        elif code == 'RIGHT_Y': device.right_joystick(x_value=None, y_value=int(value))
+                        device.update()
                 except Exception as e:
                     logger.debug(f"Axis handling error: {e}")
