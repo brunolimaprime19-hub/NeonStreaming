@@ -11,6 +11,7 @@ if os.name != "nt":
 from aiohttp import web
 from aiortc import RTCPeerConnection, RTCSessionDescription
 import sys
+import subprocess
 
 def get_resource_path(relative_path):
     """ Get absolute path to resource, works for dev and for PyInstaller """

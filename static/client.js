@@ -142,16 +142,23 @@ class WebGLRenderer {
     }
 
     render() {
-        if (!this.enabled || this.video.readyState < 2) return;
+        if (!this.enabled) return;
+
+        if (this.video.readyState < 2) {
+            // Video not ready yet, wait for next frame to check again
+            requestAnimationFrame(() => this.render());
+            return;
+        }
 
         const gl = this.gl;
+        if (!gl) return;
 
         // Match canvas size to display size
-        if (this.canvas.width !== this.video.videoWidth || this.canvas.height !== this.video.videoHeight) {
-            // We want the canvas to be the target resolution, but for now we match display container
-            const container = this.video.parentElement;
+        const container = this.video.parentElement;
+        if (this.canvas.width !== container.clientWidth || this.canvas.height !== container.clientHeight) {
             this.canvas.width = container.clientWidth;
             this.canvas.height = container.clientHeight;
+            console.log(`FSR: Resizing canvas to ${this.canvas.width}x${this.canvas.height}`);
         }
 
         gl.viewport(0, 0, this.canvas.width, this.canvas.height);
@@ -168,9 +175,7 @@ class WebGLRenderer {
         gl.bindVertexArray(this.vao);
         gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
 
-        if (this.enabled) {
-            requestAnimationFrame(() => this.render());
-        }
+        requestAnimationFrame(() => this.render());
     }
 
     enable() {
