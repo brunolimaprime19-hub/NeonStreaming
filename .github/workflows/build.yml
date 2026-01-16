@@ -28,7 +28,9 @@ jobs:
 
     - name: Install Windows-specific dependencies
       if: matrix.os == 'windows-latest'
-      run: pip install vgamepad psutil
+      run: |
+        choco install vigembus -y
+        pip install vgamepad psutil
 
     - name: Build with PyInstaller
       run: python build.py
