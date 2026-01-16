@@ -1675,11 +1675,14 @@ function updateRecTimer() {
 // Mouse and Keyboard support removed
 
 // Quality Toggle
-let currentQuality = '1080p';
+let currentQuality = '720p';
 const qualityBtn = document.getElementById('quality-btn');
 const qualityText = document.getElementById('quality-text');
 
 if (qualityBtn) {
+    // Set initial text
+    qualityText.textContent = currentQuality.toUpperCase();
+
     qualityBtn.addEventListener('click', async () => {
         // Cycle quality: 720p -> 1080p -> 2k -> 4k
         const sequence = ['720p', '1080p', '2k', '4k'];
