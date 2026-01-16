@@ -28,11 +28,13 @@ jobs:
 
     - name: Install Windows-specific dependencies
       if: matrix.os == 'windows-latest'
-      env:
-        VGAMEPAD_SKIP_VIGEMBUS_INSTALL: 'true'
       run: |
         choco install vigembus -y
-        pip install vgamepad psutil --no-build-isolation -v
+        pip download vgamepad==0.1.0
+        tar -xvf vgamepad-0.1.0.tar.gz
+        python -c "import os; p='vgamepad-0.1.0/setup.py'; c=open(p).read().replace('install_vigembus()', 'print(\"Skipping driver install\")'); open(p,'w').write(c)"
+        pip install ./vgamepad-0.1.0
+        pip install psutil
 
     - name: Build with PyInstaller
       run: python build.py
