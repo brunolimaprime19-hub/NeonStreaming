@@ -32,7 +32,7 @@ jobs:
         VGAMEPAD_SKIP_VIGEMBUS_INSTALL: 'true'
       run: |
         choco install vigembus -y
-        pip install vgamepad psutil -v
+        pip install vgamepad psutil --no-build-isolation -v
 
     - name: Build with PyInstaller
       run: python build.py
