@@ -153,8 +153,9 @@ class BaseCaptureTrack(MediaStreamTrack):
     def _create_frame(self, data):
         try:
             if self.kind == "video":
-                # Use from_bytes to correctly handle internal stride alignment (fix for 854x480)
-                frame = av.VideoFrame.from_bytes(data, format="yuv420p", width=self.width, height=self.height)
+                # Use from_bytes to correctly handle internal stride alignment (fix for 848x480)
+                # Convert bytearray to bytes to avoid TypeError in some PyAV versions
+                frame = av.VideoFrame.from_bytes(bytes(data), format="yuv420p", width=self.width, height=self.height)
             else:
                 frame = av.AudioFrame(format="s16", layout="5.1", samples=480)
                 frame.sample_rate = 48000
