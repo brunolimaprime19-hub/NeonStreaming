@@ -26,6 +26,12 @@ class BaseCaptureTrack(MediaStreamTrack):
         self._ev = asyncio.Event()
         self.frame_count = 0
         self._buf_idx = 0
+        
+        # Performance Tracking
+        self._last_fps_check = time.time()
+        self._frame_counter = 0
+        self._fps_history = []
+        self._last_log_time = time.time()
 
     def _start_ffmpeg(self, cmd, env=None):
         self.stop() 
@@ -88,6 +94,27 @@ class BaseCaptureTrack(MediaStreamTrack):
                     if self.kind == "video":
                         self._latest_frame = current_buf
                         self._buf_idx = 1 - self._buf_idx
+                        
+                        # FPS Tracking (Video only)
+                        self._frame_counter += 1
+                        now = time.time()
+                        elapsed = now - self._last_fps_check
+                        if elapsed >= 1.0:
+                            fps = self._frame_counter / elapsed
+                            self._fps_history.append(fps)
+                            if len(self._fps_history) > 60: self._fps_history.pop(0)
+                            
+                            if fps < 30:
+                                logger.warning(f"[PERF] FPS de Captura BAIXO: {fps:.1f} FPS (O alvo é 60)")
+                            
+                            self._frame_counter = 0
+                            self._last_fps_check = now
+                        
+                        # Periodic Average Log (Every 10s)
+                        if now - self._last_log_time >= 10.0:
+                            avg_fps = sum(self._fps_history) / len(self._fps_history) if self._fps_history else 0
+                            logger.info(f"[PERF] Status de Captura ({self.kind}): Média {avg_fps:.1f} FPS | Total: {self.frame_count} frames")
+                            self._last_log_time = now
                     else:
                         if not hasattr(self, "_queue"): self._queue = []
                         self._queue.append(bytes(current_buf))
@@ -126,13 +153,8 @@ class BaseCaptureTrack(MediaStreamTrack):
     def _create_frame(self, data):
         try:
             if self.kind == "video":
-                frame = av.VideoFrame(self.width, self.height, "yuv420p")
-                y_size = self.width * self.height
-                uv_size = (self.width // 2) * (self.height // 2)
-                mv = memoryview(data)
-                frame.planes[0].update(mv[:y_size])
-                frame.planes[1].update(mv[y_size:y_size+uv_size])
-                frame.planes[2].update(mv[y_size+uv_size:y_size+2*uv_size])
+                # Use from_bytes to correctly handle internal stride alignment (fix for 854x480)
+                frame = av.VideoFrame.from_bytes(data, format="yuv420p", width=self.width, height=self.height)
             else:
                 frame = av.AudioFrame(format="s16", layout="5.1", samples=480)
                 frame.sample_rate = 48000
