@@ -28,6 +28,8 @@ jobs:
 
     - name: Install Windows-specific dependencies
       if: matrix.os == 'windows-latest'
+      env:
+        VGAMEPAD_SKIP_VIGEMBUS_INSTALL: 'true'
       run: |
         choco install vigembus -y
         pip install vgamepad psutil
