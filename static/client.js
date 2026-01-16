@@ -145,10 +145,14 @@ class WebGLRenderer {
         if (!this.enabled) return;
 
         if (this.video.readyState < 2) {
-            // Video not ready yet, wait for next frame to check again
+            if (this._lastState !== this.video.readyState) {
+                console.log(`FSR: Waiting for video (readyState: ${this.video.readyState})`);
+                this._lastState = this.video.readyState;
+            }
             requestAnimationFrame(() => this.render());
             return;
         }
+        this._lastState = this.video.readyState;
 
         const gl = this.gl;
         if (!gl) return;
@@ -158,7 +162,7 @@ class WebGLRenderer {
         if (this.canvas.width !== container.clientWidth || this.canvas.height !== container.clientHeight) {
             this.canvas.width = container.clientWidth;
             this.canvas.height = container.clientHeight;
-            console.log(`FSR: Resizing canvas to ${this.canvas.width}x${this.canvas.height}`);
+            console.log(`FSR: Canvas Resized to ${this.canvas.width}x${this.canvas.height} | Video: ${this.video.videoWidth}x${this.video.videoHeight}`);
         }
 
         gl.viewport(0, 0, this.canvas.width, this.canvas.height);
@@ -180,14 +184,14 @@ class WebGLRenderer {
 
     enable() {
         this.enabled = true;
-        this.video.classList.add('hidden');
+        this.video.classList.add('video-off');
         this.canvas.classList.remove('hidden');
         this.render();
     }
 
     disable() {
         this.enabled = false;
-        this.video.classList.remove('hidden');
+        this.video.classList.remove('video-off');
         this.canvas.classList.add('hidden');
     }
 }
