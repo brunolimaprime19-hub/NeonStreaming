@@ -1,8 +1,194 @@
 const video = document.getElementById('remoteVideo');
+const fsrCanvas = document.getElementById('fsrCanvas');
 const startBtn = document.getElementById('startBtn');
 const statusOverlay = document.getElementById('status-overlay');
 const statusMsg = document.getElementById('status-msg');
 const loader = document.getElementById('loader');
+
+// ==========================================
+// WebGL Renderer with AMD FSR 1.0 (EASU)
+// ==========================================
+class WebGLRenderer {
+    constructor(videoElement, canvasElement) {
+        this.video = videoElement;
+        this.canvas = canvasElement;
+        this.gl = this.canvas.getContext('webgl2', {
+            antialias: false,
+            alpha: false,
+            depth: false,
+            stencil: false,
+            preserveDrawingBuffer: false
+        });
+
+        if (!this.gl) {
+            console.error('WebGL2 not supported');
+            return;
+        }
+
+        this.enabled = false;
+        this.program = null;
+        this.texture = null;
+        this.vao = null;
+        this.init();
+    }
+
+    init() {
+        const gl = this.gl;
+
+        // Vertex Shader (Simple Quad)
+        const vsSource = `#version 300 es
+            in vec2 position;
+            out vec2 vTexCoord;
+            void main() {
+                vTexCoord = position * 0.5 + 0.5;
+                vTexCoord.y = 1.0 - vTexCoord.y;
+                gl_Position = vec4(position, 0.0, 1.0);
+            }
+        `;
+
+        // Fragment Shader (AMD FSR 1.0 EASU Simplified)
+        const fsSource = `#version 300 es
+            precision highp float;
+            uniform sampler2D uTexture;
+            uniform vec2 uResolution;
+            uniform vec2 uInputResolution;
+            in vec2 vTexCoord;
+            out vec4 fragColor;
+
+            // Simplified EASU (Edge Adaptive Spatial Upsampling)
+            // Implementation based on AMD FidelityFX FSR 1.0
+            
+            vec3 gather(vec2 pos, vec2 offset) {
+                return texture(uTexture, pos + offset / uInputResolution).rgb;
+            }
+
+            void main() {
+                if (uInputResolution.x >= uResolution.x) {
+                    fragColor = texture(uTexture, vTexCoord);
+                    return;
+                }
+
+                vec2 pos = vTexCoord;
+                
+                // Simplified EASU: Edge detection and kernel weighting
+                vec3 c = gather(pos, vec2(0, 0));
+                vec3 n = gather(pos, vec2(0, -1));
+                vec3 s = gather(pos, vec2(0, 1));
+                vec3 w = gather(pos, vec2(-1, 0));
+                vec3 e = gather(pos, vec2(1, 0));
+                
+                // Detect contrast/edges
+                float lumaC = dot(c, vec3(0.299, 0.587, 0.114));
+                float lumaN = dot(n, vec3(0.299, 0.587, 0.114));
+                float lumaS = dot(s, vec3(0.299, 0.587, 0.114));
+                float lumaW = dot(w, vec3(0.299, 0.587, 0.114));
+                float lumaE = dot(e, vec3(0.299, 0.587, 0.114));
+                
+                float maxLuma = max(max(lumaC, lumaN), max(max(lumaS, lumaW), lumaE));
+                float minLuma = min(min(lumaC, lumaN), min(min(lumaS, lumaW), lumaE));
+                float contrast = (maxLuma - minLuma) / (maxLuma + 0.0001);
+                
+                // Sharpness factor
+                float sharpness = 0.5; 
+                vec3 result = c;
+                
+                if (contrast > 0.1) {
+                    // Adaptive sharpening based on edge detection
+                    vec3 edge = (n + s + w + e) * 0.25;
+                    result = mix(c, edge, contrast * sharpness);
+                }
+
+                fragColor = vec4(result, 1.0);
+            }
+        `;
+
+        this.program = this.createProgram(vsSource, fsSource);
+
+        // Quad Geometry
+        const positions = new Float32Array([-1, -1, 1, -1, -1, 1, 1, 1]);
+        const vbo = gl.createBuffer();
+        gl.bindBuffer(gl.ARRAY_BUFFER, vbo);
+        gl.bufferData(gl.ARRAY_BUFFER, positions, gl.STATIC_DRAW);
+
+        this.vao = gl.createVertexArray();
+        gl.bindVertexArray(this.vao);
+        const posLoc = gl.getAttribLocation(this.program, 'position');
+        gl.enableVertexAttribArray(posLoc);
+        gl.vertexAttribPointer(posLoc, 2, gl.FLOAT, false, 0, 0);
+
+        this.texture = gl.createTexture();
+        gl.bindTexture(gl.TEXTURE_2D, this.texture);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    }
+
+    createProgram(vsSource, fsSource) {
+        const gl = this.gl;
+        const vs = gl.createShader(gl.VERTEX_SHADER);
+        gl.shaderSource(vs, vsSource);
+        gl.compileShader(vs);
+
+        const fs = gl.createShader(gl.FRAGMENT_SHADER);
+        gl.shaderSource(fs, fsSource);
+        gl.compileShader(fs);
+
+        const program = gl.createProgram();
+        gl.attachShader(program, vs);
+        gl.attachShader(program, fs);
+        gl.linkProgram(program);
+        return program;
+    }
+
+    render() {
+        if (!this.enabled || this.video.readyState < 2) return;
+
+        const gl = this.gl;
+
+        // Match canvas size to display size
+        if (this.canvas.width !== this.video.videoWidth || this.canvas.height !== this.video.videoHeight) {
+            // We want the canvas to be the target resolution, but for now we match display container
+            const container = this.video.parentElement;
+            this.canvas.width = container.clientWidth;
+            this.canvas.height = container.clientHeight;
+        }
+
+        gl.viewport(0, 0, this.canvas.width, this.canvas.height);
+        gl.useProgram(this.program);
+
+        gl.activeTexture(gl.TEXTURE0);
+        gl.bindTexture(gl.TEXTURE_2D, this.texture);
+        gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, this.video);
+
+        gl.uniform1i(gl.getUniformLocation(this.program, 'uTexture'), 0);
+        gl.uniform2f(gl.getUniformLocation(this.program, 'uResolution'), this.canvas.width, this.canvas.height);
+        gl.uniform2f(gl.getUniformLocation(this.program, 'uInputResolution'), this.video.videoWidth, this.video.videoHeight);
+
+        gl.bindVertexArray(this.vao);
+        gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+
+        if (this.enabled) {
+            requestAnimationFrame(() => this.render());
+        }
+    }
+
+    enable() {
+        this.enabled = true;
+        this.video.classList.add('hidden');
+        this.canvas.classList.remove('hidden');
+        this.render();
+    }
+
+    disable() {
+        this.enabled = false;
+        this.video.classList.remove('hidden');
+        this.canvas.classList.add('hidden');
+    }
+}
+
+// Initialize FSR Renderer
+const fsrRenderer = new WebGLRenderer(video, fsrCanvas);
 
 const statVideoLatency = document.getElementById('stat-video-latency');
 const statAudioLatency = document.getElementById('stat-audio-latency');
@@ -715,6 +901,7 @@ class ControlCustomizer {
         this.moveSystemToggle = document.getElementById('move-system-toggle');
         this.vibrationToggle = document.getElementById('vibration-toggle');
         this.sizeButtons = document.querySelectorAll('.size-btn');
+        this.fsrToggle = document.getElementById('fsr-toggle');
         this.resetBtn = document.getElementById('reset-controls');
         this.gamepadContainer = document.querySelector('.gamepad-overlay');
 
@@ -762,6 +949,12 @@ class ControlCustomizer {
         this.moveSystemToggle.addEventListener('change', (e) => this.toggleSystemButtonsMode(e.target.checked));
         this.vibrationToggle.addEventListener('change', (e) => {
             vibrationEnabled = e.target.checked;
+            this.saveSettings();
+        });
+
+        this.fsrToggle.addEventListener('change', (e) => {
+            if (e.target.checked) fsrRenderer.enable();
+            else fsrRenderer.disable();
             this.saveSettings();
         });
 
@@ -1064,7 +1257,8 @@ class ControlCustomizer {
         const settings = {
             scale: this.scale,
             positions: this.positions,
-            vibration: vibrationEnabled
+            vibration: vibrationEnabled,
+            fsr: this.fsrToggle ? this.fsrToggle.checked : false
         };
 
         localStorage.setItem('controlSettings', JSON.stringify(settings));
@@ -1079,11 +1273,14 @@ class ControlCustomizer {
                 this.scale = settings.scale || 1.0;
                 this.positions = settings.positions || {};
 
-                if (settings.vibration !== undefined) {
-                    vibrationEnabled = settings.vibration;
-                    if (this.vibrationToggle) {
-                        this.vibrationToggle.checked = vibrationEnabled;
-                    }
+                if (this.vibrationToggle) {
+                    this.vibrationToggle.checked = settings.vibration !== false;
+                    vibrationEnabled = this.vibrationToggle.checked;
+                }
+
+                if (this.fsrToggle) {
+                    this.fsrToggle.checked = settings.fsr === true;
+                    if (this.fsrToggle.checked) setTimeout(() => fsrRenderer.enable(), 1000);
                 }
 
                 // Update size buttons

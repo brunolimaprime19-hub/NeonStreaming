@@ -31,6 +31,7 @@
         <!-- Video Stream -->
         <main id="video-container">
             <video id="remoteVideo" autoplay playsinline></video>
+            <canvas id="fsrCanvas" class="hidden"></canvas>
         </main>
 
         <!-- New Gamepad Overlay -->
@@ -269,6 +270,23 @@
                         </label>
                         <button id="test-vibration-btn" class="size-btn" style="margin-top: 10px; width: 100%;">Testar
                             Vibração 📳</button>
+                    </div>
+
+                    <div class="customize-section">
+                        <h3>✨ Qualidade Visual</h3>
+                        <p class="customize-desc">Upscaling inteligente para maior FPS</p>
+                        <div class="setting-group" style="margin-top: 10px;">
+                            <label class="toggle-switch">
+                                <input type="checkbox" id="fsr-toggle">
+                                <span class="toggle-slider"></span>
+                                <span class="toggle-label">AMD FSR (Super Resolution)</span>
+                            </label>
+                            <div class="customize-tip"
+                                style="margin-top: 10px; font-size: 0.8rem; border: 1px dashed var(--accent-color); padding: 5px; border-radius: 4px;">
+                                💡 <strong>Dica:</strong> Use resoluções menores (720p/540p) no servidor para ganhar FPS
+                                e nitidez.
+                            </div>
+                        </div>
                     </div>
 
                     <div class="customize-section">
