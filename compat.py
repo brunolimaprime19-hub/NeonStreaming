@@ -259,6 +259,11 @@ aiortc.contrib.media.av.AudioResampler = SafeResampler
 
 # --- OPUS ENCODER PATCH ---
 def patched_opus_encode(self, frame, force_keyframe=False):
+    # --- PASSTHROUGH OPTIMIZATION ---
+    if hasattr(frame, "_encoded_payload"):
+        # Expecting _encoded_payload to be a list of bytes and a timestamp
+        return frame._encoded_payload
+        
     frames = []
     if (frame.sample_rate == 48000 and len(frame.layout.channels) in [2, 6] and frame.format.name == 's16'):
         frames = [frame]

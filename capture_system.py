@@ -74,23 +74,31 @@ class BaseCaptureTrack(MediaStreamTrack):
         parser = None
         if hasattr(self, "is_encoded") and self.is_encoded:
             try:
-                codec = av.Codec('h264', 'r')
+                codec_name = 'h264' if self.kind == "video" else 'opus'
+                codec = av.Codec(codec_name, 'r')
                 parser = av.CodecContext.create(codec)
             except Exception as e:
-                logger.error(f"Failed to create H264 parser: {e}")
+                logger.error(f"Failed to create {self.kind} parser: {e}")
 
         while self._running and self.process:
             try:
                 if parser:
-                    # Encoded mode: Read chunks and parse NALUs
+                    # Encoded mode: Read chunks and parse NALUs/Packets
                     chunk = self.process.stdout.read(4096)
-                    if not chunk: break
+                    if not chunk: 
+                        logger.warning(f"[{self.kind.upper()}] No output from FFmpeg")
+                        break
                     
                     packets = parser.parse(chunk)
                     for packet in packets:
                         if not packet.data: continue
                         with self._lock:
-                            self._latest_frame = packet.data
+                            if self.kind == "video":
+                                self._latest_frame = packet.data
+                            else:
+                                if not hasattr(self, "_queue"): self._queue = []
+                                self._queue.append(packet.data)
+                                if len(self._queue) > 30: self._queue.pop(0) # Slightly larger queue for audio packets
                             self._frame_counter += 1
                         self._ev.set()
                 else:
@@ -170,13 +178,11 @@ class BaseCaptureTrack(MediaStreamTrack):
         try:
             if self.kind == "video":
                 if hasattr(self, "is_encoded") and self.is_encoded:
-                    # Passthrough mode: Create a dummy frame with the encoded payload
-                    # We use a small placeholder to satisfy aiortc's checks
+                    # Video Passthrough
                     frame = av.VideoFrame(16, 16, "yuv420p")
-                    # data here is the encoded H.264 bytes
                     frame._encoded_payload = [data]
                 else:
-                    # Raw mode
+                    # Raw Video mode
                     frame = av.VideoFrame(self.width, self.height, "yuv420p")
                     y_size = self.width * self.height
                     u_size = (self.width // 2) * (self.height // 2)
@@ -187,9 +193,19 @@ class BaseCaptureTrack(MediaStreamTrack):
                     frame.planes[1].update(u_plane)
                     frame.planes[2].update(v_plane)
             else:
-                frame = av.AudioFrame(format="s16", layout="5.1", samples=480)
-                frame.sample_rate = 48000
-                frame.planes[0].update(data)
+                if hasattr(self, "is_encoded") and self.is_encoded:
+                    # Audio Passthrough
+                    # We create a dummy frame to carry the Opus payload
+                    frame = av.AudioFrame(format="s16", layout="stereo", samples=960)
+                    frame.sample_rate = 48000
+                    # Return payload and timestamp as expected by patched_opus_encode
+                    # data is the encoded Opus bytes
+                    frame._encoded_payload = ([data], self.frame_count * 960) # 20ms fixed step
+                else:
+                    # Raw Audio mode
+                    frame = av.AudioFrame(format="s16", layout="5.1", samples=480)
+                    frame.sample_rate = 48000
+                    frame.planes[0].update(data)
 
             pts, tb = self._get_pts()
             frame.pts = pts
@@ -225,7 +241,7 @@ class BaseCaptureTrack(MediaStreamTrack):
     def __del__(self):
         self.stop()
 
-class PulseAudioTrack(BaseCaptureTrack):
+class EncodedAudioTrack(BaseCaptureTrack):
     kind = "audio"
     def __init__(self, args, device="default"):
         super().__init__()
@@ -233,8 +249,8 @@ class PulseAudioTrack(BaseCaptureTrack):
         self.device = device
         if self.device == "default":
             self.device = self._find_best_audio_source()
-        self.channels = 6 
-        self.frame_size = 480 * self.channels * 2 
+        self.is_encoded = True
+        self.frame_size = 0 
         self._queue = []
     
     def _find_best_audio_source(self):
@@ -257,7 +273,7 @@ class PulseAudioTrack(BaseCaptureTrack):
         return "default"
 
     def _get_pts(self):
-        pts = self.frame_count * 480
+        pts = self.frame_count * 960
         tb = fractions.Fraction(1, 48000)
         self.frame_count += 1
         return pts, tb
@@ -265,22 +281,19 @@ class PulseAudioTrack(BaseCaptureTrack):
     def _start_capture(self):
         cmd = [
             "ffmpeg", "-y", "-hide_banner", "-loglevel", "warning",
-            "-fflags", "nobuffer+flush_packets", "-flags", "low_delay",
-            "-threads", "1",
-            "-f", "pulse", 
-            "-thread_queue_size", "512", 
-            "-i", self.device,
-            "-ac", str(self.channels), "-ar", "48000",
-            "-probesize", "32k", "-analyzeduration", "0",
-            "-af", "aresample=async=1,volume=1.2",
-            "-c:a", "pcm_s16le", "-f", "s16le", "-"
+            "-f", "pulse", "-i", self.device,
+            "-ac", "2", "-ar", "48000",
+            "-c:a", "libopus", "-b:a", f"{getattr(self.args, 'audio_bitrate', 128)}k",
+            "-vbr", "on", "-compression_level", "10", "-frame_duration", "20",
+            "-application", "lowdelay",
+            "-f", "opus", "-"
         ]
-        if getattr(self.args, 'audio_gpu', False):
-             logger.info("[AUDIO] Modo GPU/Ultra-Low Latency Ativado (Requested by User)")
+        
+        latency = "10"
+        if getattr(self.args, 'audio_gpu', False) or getattr(self.args, 'ultra_low_latency', False):
              latency = "1"
-        else:
-             latency = "10"
-
+             
+        logger.info(f"[AUDIO ENCODED] CMD: {' '.join(cmd)}")
         self._start_ffmpeg(cmd, env={"PULSE_LATENCY_MSEC": latency})
 
 class WindowsAudioTrack(BaseCaptureTrack):
@@ -403,7 +416,7 @@ class MediaCaptureSystem:
             self.audio_track = WindowsAudioTrack(args)
         else:
             self.video_track = EncodedVideoTrack(pc_id, args)
-            self.audio_track = PulseAudioTrack(args)
+            self.audio_track = EncodedAudioTrack(args)
     
     def get_video_track(self): return self.video_track
     def get_audio_track(self): return self.audio_track
