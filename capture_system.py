@@ -70,59 +70,75 @@ class BaseCaptureTrack(MediaStreamTrack):
             except: break
 
     def _read_loop(self):
+        # Initialize parser if in encoded mode
+        parser = None
+        if hasattr(self, "is_encoded") and self.is_encoded:
+            try:
+                codec = av.Codec('h264', 'r')
+                parser = av.CodecContext.create(codec)
+            except Exception as e:
+                logger.error(f"Failed to create H264 parser: {e}")
+
         while self._running and self.process:
             try:
-                current_buf = None
-                if self.kind == "video":
-                    if self._buffers is None: 
-                        logger.error(f"[{self.kind.upper()}] Video buffers not initialized.")
-                        break
-                    current_buf = self._buffers[self._buf_idx]
-                else: 
-                    current_buf = bytearray(self.frame_size)
-                
-                mv = memoryview(current_buf)
-                total_read = 0
-                while total_read < self.frame_size:
-                    n = self.process.stdout.readinto(mv[total_read:])
-                    if not n: break
-                    total_read += n
-                
-                if total_read < self.frame_size: break
-                
-                with self._lock:
+                if parser:
+                    # Encoded mode: Read chunks and parse NALUs
+                    chunk = self.process.stdout.read(4096)
+                    if not chunk: break
+                    
+                    packets = parser.parse(chunk)
+                    for packet in packets:
+                        if not packet.data: continue
+                        with self._lock:
+                            self._latest_frame = packet.data
+                            self._frame_counter += 1
+                        self._ev.set()
+                else:
+                    # Raw Mode
+                    current_buf = None
                     if self.kind == "video":
-                        self._latest_frame = current_buf
-                        self._buf_idx = 1 - self._buf_idx
-                        
-                        # FPS Tracking (Video only)
-                        self._frame_counter += 1
-                        now = time.time()
-                        elapsed = now - self._last_fps_check
-                        if elapsed >= 1.0:
-                            fps = self._frame_counter / elapsed
-                            self._fps_history.append(fps)
-                            if len(self._fps_history) > 60: self._fps_history.pop(0)
-                            
-                            if fps < 30:
-                                logger.warning(f"[PERF] FPS de Captura BAIXO: {fps:.1f} FPS (O alvo é 60)")
-                            
-                            self._frame_counter = 0
-                            self._last_fps_check = now
-                        
-                        # Periodic Average Log (Every 10s)
-                        if now - self._last_log_time >= 10.0:
-                            avg_fps = sum(self._fps_history) / len(self._fps_history) if self._fps_history else 0
-                            logger.info(f"[PERF] Status de Captura ({self.kind}): Média {avg_fps:.1f} FPS | Total: {self.frame_count} frames")
-                            self._last_log_time = now
-                    else:
-                        if not hasattr(self, "_queue"): self._queue = []
-                        self._queue.append(bytes(current_buf))
-                        if len(self._queue) > 15: self._queue.pop(0)
+                        if self._buffers is None: break
+                        current_buf = self._buffers[self._buf_idx]
+                    else: 
+                        current_buf = bytearray(self.frame_size)
+                    
+                    mv = memoryview(current_buf)
+                    total_read = 0
+                    while total_read < self.frame_size:
+                        n = self.process.stdout.readinto(mv[total_read:])
+                        if not n: break
+                        total_read += n
+                    
+                    if total_read < self.frame_size: break
+                    
+                    with self._lock:
+                        if self.kind == "video":
+                            self._latest_frame = current_buf
+                            self._buf_idx = 1 - self._buf_idx
+                            self._frame_counter += 1
+                        else:
+                            if not hasattr(self, "_queue"): self._queue = []
+                            self._queue.append(bytes(current_buf))
+                            if len(self._queue) > 15: self._queue.pop(0)
+                        self._ev.set()
 
-                self._ev.set()
+                # Common FPS Tracking
+                now = time.time()
+                if now - self._last_fps_check >= 1.0:
+                    fps = self._frame_counter / (now - self._last_fps_check)
+                    self._fps_history.append(fps)
+                    if len(self._fps_history) > 60: self._fps_history.pop(0)
+                    if fps < 30: logger.warning(f"[PERF] Low Capture FPS: {fps:.1f}")
+                    self._frame_counter = 0
+                    self._last_fps_check = now
+                
+                if now - self._last_log_time >= 10.0:
+                    avg_fps = sum(self._fps_history) / len(self._fps_history) if self._fps_history else 0
+                    logger.info(f"[PERF] Capture Status ({self.kind}): Avg {avg_fps:.1f} FPS")
+                    self._last_log_time = now
+
             except Exception as e:
-                logger.error(f"Erro no loop de leitura {self.kind}: {e}")
+                logger.error(f"Error in read loop {self.kind}: {e}")
                 break
         self.stop()
 
@@ -153,19 +169,23 @@ class BaseCaptureTrack(MediaStreamTrack):
     def _create_frame(self, data):
         try:
             if self.kind == "video":
-                # Manual frame creation with numpy for ultra-compatibility and stride handling
-                frame = av.VideoFrame(self.width, self.height, "yuv420p")
-                y_size = self.width * self.height
-                u_size = (self.width // 2) * (self.height // 2)
-                
-                # Convert to numpy arrays to let PyAV handle internal strides/padding
-                y_plane = np.frombuffer(data, dtype=np.uint8, count=y_size, offset=0).reshape((self.height, self.width))
-                u_plane = np.frombuffer(data, dtype=np.uint8, count=u_size, offset=y_size).reshape((self.height // 2, self.width // 2))
-                v_plane = np.frombuffer(data, dtype=np.uint8, count=u_size, offset=y_size + u_size).reshape((self.height // 2, self.width // 2))
-                
-                frame.planes[0].update(y_plane)
-                frame.planes[1].update(u_plane)
-                frame.planes[2].update(v_plane)
+                if hasattr(self, "is_encoded") and self.is_encoded:
+                    # Passthrough mode: Create a dummy frame with the encoded payload
+                    # We use a small placeholder to satisfy aiortc's checks
+                    frame = av.VideoFrame(16, 16, "yuv420p")
+                    # data here is the encoded H.264 bytes
+                    frame._encoded_payload = [data]
+                else:
+                    # Raw mode
+                    frame = av.VideoFrame(self.width, self.height, "yuv420p")
+                    y_size = self.width * self.height
+                    u_size = (self.width // 2) * (self.height // 2)
+                    y_plane = np.frombuffer(data, dtype=np.uint8, count=y_size, offset=0).reshape((self.height, self.width))
+                    u_plane = np.frombuffer(data, dtype=np.uint8, count=u_size, offset=y_size).reshape((self.height // 2, self.width // 2))
+                    v_plane = np.frombuffer(data, dtype=np.uint8, count=u_size, offset=y_size + u_size).reshape((self.height // 2, self.width // 2))
+                    frame.planes[0].update(y_plane)
+                    frame.planes[1].update(u_plane)
+                    frame.planes[2].update(v_plane)
             else:
                 frame = av.AudioFrame(format="s16", layout="5.1", samples=480)
                 frame.sample_rate = 48000
@@ -288,14 +308,14 @@ class WindowsAudioTrack(BaseCaptureTrack):
         ]
         self._start_ffmpeg(cmd)
 
-class RawVideoTrack(BaseCaptureTrack):
+class EncodedVideoTrack(BaseCaptureTrack):
     kind = "video"
     def __init__(self, pc_id, args):
         self.args = args
         self.width, self.height = map(int, args.resolution.split('x'))
-        self.fps = 60 # FORCE 60 FPS NO MATTER WHAT
-        self.frame_size = int(self.width * self.height * 1.5)
-        self._buffers = [bytearray(self.frame_size), bytearray(self.frame_size)]
+        self.fps = 60
+        self.is_encoded = True
+        self._buffers = None
         super().__init__()
         
     def _get_pts(self):
@@ -305,9 +325,6 @@ class RawVideoTrack(BaseCaptureTrack):
         return pts, tb
 
     def _start_capture(self):
-        # BALANCED_CAPTURE: Configuração focada em compatibilidade e estabilidade
-        # Ideal para uso com Encoder de Software (CPU)
-        
         input_str = ":0.0+0,0"
         src_w, src_h = "1920", "1080"
         
@@ -318,34 +335,31 @@ class RawVideoTrack(BaseCaptureTrack):
                   input_str = f":0.0+{r[0]},{r[1]}"
         except: pass
 
+        encoder = "libx264"
+        enc_opts = ["-preset", "ultrafast", "-tune", "zerolatency"]
+        
+        if self.args.encoder == "vaapi":
+            encoder = "h264_vaapi"
+            enc_opts = ["-vaapi_device", "/dev/dri/renderD128", "-vf", f"format=nv12,hwupload,scale_vaapi={self.width}:{self.height}"]
+        elif self.args.encoder == "nvenc":
+            encoder = "h264_nvenc"
+            enc_opts = ["-preset", "p1", "-tune", "ull", "-zerolatency", "1", "-vf", f"scale={self.width}:{self.height},format=yuv420p"]
+        else:
+            enc_opts += ["-vf", f"scale={self.width}:{self.height},format=yuv420p"]
+
         cmd = [
             "ffmpeg", "-y", "-hide_banner", "-loglevel", "warning",
-            
-            # --- INPUT OPTIONS ---
-            "-f", "x11grab",
-            "-rtbufsize", "64M", # Reduzido de 500M para poupar RAM
-            "-framerate", "60", 
-            # Threads Auto (sem -threads N)
-            "-draw_mouse", "0",
-            "-video_size", f"{src_w}x{src_h}",
-            "-probesize", "10M", # Reduzido de 50M
-            "-analyzeduration", "0",
-            "-i", input_str,
-            
-            # --- FILTERING ---
-            # Using simple scaling without aggressive threading force
-            "-vf", f"scale={self.width}:{self.height}",
-            
-            # --- OUTPUT ---
-            # Remover cfr forçado para evitar drift com encoder lento
-            "-r", "60",
-            
-            "-c:v", "rawvideo", 
-            "-pix_fmt", "yuv420p",
-            "-f", "rawvideo", "-"
+            "-f", "x11grab", "-framerate", "60", "-draw_mouse", "0",
+            "-video_size", f"{src_w}x{src_h}", "-i", input_str,
+            "-c:v", encoder
+        ] + enc_opts + [
+            "-b:v", f"{self.args.bitrate}k",
+            "-maxrate", f"{self.args.bitrate}k",
+            "-bufsize", f"{self.args.bitrate//10}k",
+            "-g", "60", "-f", "h264", "-"
         ]
         
-        logger.info(f"[VIDEO BALANCED] CMD: {' '.join(cmd)}")
+        logger.info(f"[VIDEO ENCODED] CMD: {' '.join(cmd)}")
         self._start_ffmpeg(cmd)
 
 class WindowsVideoTrack(BaseCaptureTrack):
@@ -388,7 +402,7 @@ class MediaCaptureSystem:
             self.video_track = WindowsVideoTrack(pc_id, args)
             self.audio_track = WindowsAudioTrack(args)
         else:
-            self.video_track = RawVideoTrack(pc_id, args)
+            self.video_track = EncodedVideoTrack(pc_id, args)
             self.audio_track = PulseAudioTrack(args)
     
     def get_video_track(self): return self.video_track

@@ -186,6 +186,10 @@ def patch_encoder_class(cls):
     # Intercept any runtime bitrate changes
     orig_encode = cls.encode
     def patched_encode(self, frame, force_keyframe=False):
+        # --- PASSTHROUGH OPTIMIZATION ---
+        if hasattr(frame, "_encoded_payload"):
+            return frame._encoded_payload
+            
         if hasattr(self, "codec"):
             requested_bitrate = ENCODER_CONFIG["bitrate"]
             limit = ENCODER_CONFIG["net_limit"]
