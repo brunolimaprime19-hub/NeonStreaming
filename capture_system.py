@@ -70,83 +70,108 @@ class BaseCaptureTrack(MediaStreamTrack):
             except: break
 
     def _read_loop(self):
-        # Initialize parser if in encoded mode
-        parser = None
         if hasattr(self, "is_encoded") and self.is_encoded:
-            try:
-                codec_name = 'h264' if self.kind == "video" else 'opus'
-                codec = av.Codec(codec_name, 'r')
-                parser = av.CodecContext.create(codec)
-            except Exception as e:
-                logger.error(f"Failed to create {self.kind} parser: {e}")
+            self._read_loop_encoded()
+        else:
+            self._read_loop_raw()
 
-        while self._running and self.process:
-            try:
-                if parser:
-                    # Encoded mode: Read chunks and parse NALUs/Packets
-                    chunk = self.process.stdout.read(4096)
-                    if not chunk: 
-                        logger.warning(f"[{self.kind.upper()}] No output from FFmpeg")
-                        break
-                    
-                    packets = parser.parse(chunk)
-                    for packet in packets:
-                        if not packet.data: continue
-                        with self._lock:
-                            if self.kind == "video":
-                                self._latest_frame = packet.data
-                            else:
-                                if not hasattr(self, "_queue"): self._queue = []
-                                self._queue.append(packet.data)
-                                if len(self._queue) > 30: self._queue.pop(0) # Slightly larger queue for audio packets
-                            self._frame_counter += 1
-                        self._ev.set()
-                else:
-                    # Raw Mode
-                    current_buf = None
+    def _read_loop_encoded(self):
+        """Robust OBS-style reading using PyAV's demuxer on the pipe."""
+        container = None
+        try:
+            # We use Annex-B for H.264 and Matroska for Opus to ensure flushable packets
+            fmt = "h264" if self.kind == "video" else "matroska"
+            container = av.open(self.process.stdout, format=fmt)
+            
+            # Identify the stream
+            stream = None
+            if self.kind == "video":
+                stream = container.streams.video[0]
+            else:
+                stream = container.streams.audio[0]
+
+            for packet in container.demux(stream):
+                if not packet.data: continue
+                
+                with self._lock:
+                    packet_bytes = bytes(packet)
                     if self.kind == "video":
-                        if self._buffers is None: break
-                        current_buf = self._buffers[self._buf_idx]
-                    else: 
-                        current_buf = bytearray(self.frame_size)
-                    
-                    mv = memoryview(current_buf)
-                    total_read = 0
-                    while total_read < self.frame_size:
-                        n = self.process.stdout.readinto(mv[total_read:])
-                        if not n: break
-                        total_read += n
-                    
-                    if total_read < self.frame_size: break
-                    
-                    with self._lock:
-                        if self.kind == "video":
-                            self._latest_frame = current_buf
-                            self._buf_idx = 1 - self._buf_idx
-                            self._frame_counter += 1
-                        else:
-                            if not hasattr(self, "_queue"): self._queue = []
-                            self._queue.append(bytes(current_buf))
-                            if len(self._queue) > 15: self._queue.pop(0)
-                        self._ev.set()
-
-                # Common FPS Tracking
+                        self._latest_frame = packet_bytes
+                    else:
+                        if not hasattr(self, "_queue"): self._queue = []
+                        self._queue.append(packet_bytes)
+                        if len(self._queue) > 50: self._queue.pop(0)
+                    self._frame_counter += 1
+                
+                self._ev.set()
+                
+                # Performance Tracking
                 now = time.time()
                 if now - self._last_fps_check >= 1.0:
                     fps = self._frame_counter / (now - self._last_fps_check)
                     self._fps_history.append(fps)
                     if len(self._fps_history) > 60: self._fps_history.pop(0)
-                    if fps < 30: logger.warning(f"[PERF] Low Capture FPS: {fps:.1f}")
                     self._frame_counter = 0
                     self._last_fps_check = now
                 
                 if now - self._last_log_time >= 10.0:
                     avg_fps = sum(self._fps_history) / len(self._fps_history) if self._fps_history else 0
-                    logger.info(f"[PERF] Capture Status ({self.kind}): Avg {avg_fps:.1f} FPS")
+                    logger.info(f"[PERF] Capture {self.kind} (ENCODED): {avg_fps:.1f} FPS")
+                    self._last_log_time = now
+
+        except Exception as e:
+            if self._running:
+                logger.error(f"Error in encoded read loop {self.kind}: {e}")
+        finally:
+            if container: container.close()
+            self.stop()
+
+    def _read_loop_raw(self):
+        """Standard raw pipe reading."""
+        while self._running and self.process:
+            try:
+                current_buf = None
+                if self.kind == "video":
+                    if self._buffers is None: break
+                    current_buf = self._buffers[self._buf_idx]
+                else: 
+                    current_buf = bytearray(self.frame_size)
+                
+                mv = memoryview(current_buf)
+                total_read = 0
+                while total_read < self.frame_size:
+                    n = self.process.stdout.readinto(mv[total_read:])
+                    if not n: break
+                    total_read += n
+                
+                if total_read < self.frame_size: break
+                
+                with self._lock:
+                    if self.kind == "video":
+                        self._latest_frame = current_buf
+                        self._buf_idx = 1 - self._buf_idx
+                    else:
+                        if not hasattr(self, "_queue"): self._queue = []
+                        self._queue.append(bytes(current_buf))
+                        if len(self._queue) > 15: self._queue.pop(0)
+                    self._frame_counter += 1
+                self._ev.set()
+
+                now = time.time()
+                if now - self._last_fps_check >= 1.0:
+                    fps = self._frame_counter / (now - self._last_fps_check)
+                    self._fps_history.append(fps)
+                    if len(self._fps_history) > 60: self._fps_history.pop(0)
+                    self._frame_counter = 0
+                    self._last_fps_check = now
+                
+                if now - self._last_log_time >= 10.0:
+                    avg_fps = sum(self._fps_history) / len(self._fps_history) if self._fps_history else 0
+                    logger.info(f"[PERF] Capture {self.kind} (RAW): {avg_fps:.1f} FPS")
                     self._last_log_time = now
 
             except Exception as e:
-                logger.error(f"Error in read loop {self.kind}: {e}")
+                logger.error(f"Error in raw read loop {self.kind}: {e}")
                 break
         self.stop()
 
@@ -195,12 +220,10 @@ class BaseCaptureTrack(MediaStreamTrack):
             else:
                 if hasattr(self, "is_encoded") and self.is_encoded:
                     # Audio Passthrough
-                    # We create a dummy frame to carry the Opus payload
                     frame = av.AudioFrame(format="s16", layout="stereo", samples=960)
                     frame.sample_rate = 48000
-                    # Return payload and timestamp as expected by patched_opus_encode
-                    # data is the encoded Opus bytes
-                    frame._encoded_payload = ([data], self.frame_count * 960) # 20ms fixed step
+                    # Return payload as list of bytes
+                    frame._encoded_payload = [data]
                 else:
                     # Raw Audio mode
                     frame = av.AudioFrame(format="s16", layout="5.1", samples=480)
@@ -279,6 +302,7 @@ class EncodedAudioTrack(BaseCaptureTrack):
         return pts, tb
 
     def _start_capture(self):
+        # OBS-Style: Direct Opus encoding in Matroska for robust piping
         cmd = [
             "ffmpeg", "-y", "-hide_banner", "-loglevel", "warning",
             "-f", "pulse", "-i", self.device,
@@ -286,14 +310,14 @@ class EncodedAudioTrack(BaseCaptureTrack):
             "-c:a", "libopus", "-b:a", f"{getattr(self.args, 'audio_bitrate', 128)}k",
             "-vbr", "on", "-compression_level", "10", "-frame_duration", "20",
             "-application", "lowdelay",
-            "-f", "opus", "-"
+            "-f", "matroska", "-cluster_size_limit", "2", "-cluster_time_limit", "10", "-"
         ]
         
         latency = "10"
         if getattr(self.args, 'audio_gpu', False) or getattr(self.args, 'ultra_low_latency', False):
              latency = "1"
              
-        logger.info(f"[AUDIO ENCODED] CMD: {' '.join(cmd)}")
+        logger.info(f"[AUDIO OBS-STYLE] CMD: {' '.join(cmd)}")
         self._start_ffmpeg(cmd, env={"PULSE_LATENCY_MSEC": latency})
 
 class WindowsAudioTrack(BaseCaptureTrack):
@@ -348,17 +372,39 @@ class EncodedVideoTrack(BaseCaptureTrack):
                   input_str = f":0.0+{r[0]},{r[1]}"
         except: pass
 
+        # OBS-Style Encoder Selection & Tuning
         encoder = "libx264"
         enc_opts = ["-preset", "ultrafast", "-tune", "zerolatency"]
         
-        if self.args.encoder == "vaapi":
+        # Determine target encoder
+        req_enc = getattr(self.args, 'encoder', 'auto').lower()
+        
+        if req_enc in ["vaapi", "gpu", "auto"] and os.path.exists("/dev/dri/renderD128"):
             encoder = "h264_vaapi"
-            enc_opts = ["-vaapi_device", "/dev/dri/renderD128", "-vf", f"format=nv12,hwupload,scale_vaapi={self.width}:{self.height}"]
-        elif self.args.encoder == "nvenc":
+            enc_opts = [
+                "-vaapi_device", "/dev/dri/renderD128", 
+                "-vf", f"format=nv12,hwupload,scale_vaapi={self.width}:{self.height}",
+                "-rc_mode", "CBR",
+                "-filler_data", "1",
+                "-qp", "24" # Default quality point for VAAPI CBR
+            ]
+            if req_enc == "vaapi": logger.info("[VIDEO] Force VAAPI (AMD/Intel)")
+            
+        elif req_enc in ["nvenc", "gpu"]:
             encoder = "h264_nvenc"
-            enc_opts = ["-preset", "p1", "-tune", "ull", "-zerolatency", "1", "-vf", f"scale={self.width}:{self.height},format=yuv420p"]
+            enc_opts = [
+                "-preset", "p1", 
+                "-tune", "ull", 
+                "-zerolatency", "1", 
+                "-delay", "0",
+                "-rc", "cbr",
+                "-vf", f"scale={self.width}:{self.height},format=yuv420p"
+            ]
+            logger.info("[VIDEO] Using NVENC (Nvidia)")
         else:
+            # CPU or fallback
             enc_opts += ["-vf", f"scale={self.width}:{self.height},format=yuv420p"]
+            logger.info("[VIDEO] Using Software/CPU (libx264)")
 
         cmd = [
             "ffmpeg", "-y", "-hide_banner", "-loglevel", "warning",
@@ -372,7 +418,7 @@ class EncodedVideoTrack(BaseCaptureTrack):
             "-g", "60", "-f", "h264", "-"
         ]
         
-        logger.info(f"[VIDEO ENCODED] CMD: {' '.join(cmd)}")
+        logger.info(f"[VIDEO OBS-STYLE] CMD: {' '.join(cmd)}")
         self._start_ffmpeg(cmd)
 
 class WindowsVideoTrack(BaseCaptureTrack):
